@@ -1,0 +1,10 @@
+{
+  "id": "IntroSkip",
+  "name": "IntroSkip",
+  "author": "CubeCat",
+  "description": "Skips the startup logo intro and enters the main menu immediately.",
+  "version": "0.1.0",
+  "has_pck": false,
+  "has_dll": true,
+  "affects_gameplay": false
+}
