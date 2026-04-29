@@ -1,14 +1,17 @@
 using System.Reflection;
 using System.Collections;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Assets;
+using MegaCrit.Sts2.Core.Bindings.MegaSpine;
 using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Modding;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Screens.MainMenu;
+using OpCodes = System.Reflection.Emit.OpCodes;
 
 namespace IntroSkip;
 
@@ -37,16 +40,21 @@ internal static class LaunchMainMenuPatch
 
     private static async Task LaunchMainMenuWithAnimatedLoading(NGame game)
     {
+        Stopwatch stopwatch = Stopwatch.StartNew();
         LoadingProgressTracker.Reset();
+        MainFile.Logger.Info("Startup loading started.");
+        _ = RunIntroSequence(game, stopwatch);
         Task mainMenuLoadTask = PreloadManager.LoadMainMenuEssentials();
-        _ = RunIntroSequence(game);
 
         await mainMenuLoadTask;
+        MainFile.Logger.Info($"Main menu essentials loaded in {stopwatch.Elapsed.TotalSeconds:F2}s.");
         await LoadMainMenu(game);
+        MainFile.Logger.Info($"Main menu loaded in {stopwatch.Elapsed.TotalSeconds:F2}s.");
         _ = LoadDeferredStartupAssetsAsync(game);
+        MainFile.Logger.Info($"Startup loading flow finished in {stopwatch.Elapsed.TotalSeconds:F2}s.");
     }
 
-    private static async Task RunIntroSequence(NGame game)
+    private static async Task RunIntroSequence(NGame game, Stopwatch stopwatch)
     {
         CanvasLayer? layer = null;
         using CancellationTokenSource progressCancelToken = new();
@@ -68,17 +76,24 @@ internal static class LaunchMainMenuPatch
             LoadingProgressOverlay progressOverlay = LoadingProgressOverlay.Create(logoAnimation);
             Task progressTask = progressOverlay.RunAsync(progressCancelToken.Token);
 
-            await FadeLayer(logoAnimation, 0f, 1f, 0.8f);
+            await FadeLayer(logoAnimation, 0f, 1f, 0.2f);
+            MainFile.Logger.Info($"Logo fade-in finished at {stopwatch.Elapsed.TotalSeconds:F2}s.");
             Task animationTask = logoAnimation.PlayAnimation(progressCancelToken.Token);
-            await Task.WhenAny(animationTask, progressTask);
+            MainFile.Logger.Info($"Logo animation started at {stopwatch.Elapsed.TotalSeconds:F2}s.");
+            Task completedTask = await Task.WhenAny(animationTask, progressTask);
+            MainFile.Logger.Info(completedTask == animationTask
+                ? $"Logo animation completed at {stopwatch.Elapsed.TotalSeconds:F2}s."
+                : $"Logo animation skipped after loading progress completed at {stopwatch.Elapsed.TotalSeconds:F2}s.");
 
             progressOverlay.SetProgress(1f);
-            await progressCancelToken.CancelAsync();
-            await IgnoreCancellation(animationTask);
-            await IgnoreCancellation(progressTask);
+            MainFile.Logger.Info($"Intro fade-out started at {stopwatch.Elapsed.TotalSeconds:F2}s.");
             await Task.WhenAll(
-                FadeLayer(logoAnimation, 1f, 0f, 0.8f),
-                progressOverlay.FadeOutAsync(0.8f));
+                FadeLayer(logoAnimation, 1f, 0f, 0.4f),
+                progressOverlay.FadeOutAsync(0.4f));
+            MainFile.Logger.Info($"Intro fade-out finished at {stopwatch.Elapsed.TotalSeconds:F2}s.");
+            await progressCancelToken.CancelAsync();
+            _ = IgnoreCancellation(animationTask);
+            _ = IgnoreCancellation(progressTask);
         }
         catch (Exception ex)
         {
@@ -142,6 +157,59 @@ internal static class TrackAssetLoadingSessionPatch
     private static void Postfix(AssetLoadingSession __result)
     {
         LoadingProgressTracker.Track(__result);
+    }
+}
+
+[HarmonyPatch]
+internal static class LogoAnimationStartupDelayPatch
+{
+    private const double StartupDelaySeconds = 0.0;
+    private const float AnimationTimeScale = 8.0f;
+
+    private static MethodBase TargetMethod()
+    {
+        Type? stateMachineType = Array.Find(
+            typeof(NLogoAnimation).GetNestedTypes(BindingFlags.NonPublic),
+            type => type.Name.Contains("<PlayAnimation>"));
+
+        return AccessTools.Method(stateMachineType, "MoveNext");
+    }
+
+    private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        MethodInfo tweenIntervalMethod = AccessTools.Method(typeof(Tween), "TweenInterval", [typeof(double)]);
+        MethodInfo setAnimationMethod = AccessTools.Method(typeof(MegaAnimationState), "SetAnimation", [typeof(string), typeof(bool), typeof(int)]);
+        MethodInfo setTimeScaleMethod = AccessTools.Method(typeof(MegaTrackEntry), "SetTimeScale", [typeof(float)]);
+        List<CodeInstruction> codes = [.. instructions];
+        bool startupDelayReplaced = false;
+        bool timeScaleInjected = false;
+
+        for (int i = 1; i < codes.Count; i++)
+        {
+            if (startupDelayReplaced == false
+                && codes[i].Calls(tweenIntervalMethod)
+                && codes[i - 1].opcode == OpCodes.Ldc_R8
+                && codes[i - 1].operand is double value
+                && value == 1d)
+            {
+                codes[i - 1].operand = StartupDelaySeconds;
+                startupDelayReplaced = true;
+            }
+
+            if (timeScaleInjected == false && codes[i].Calls(setAnimationMethod))
+            {
+                codes.InsertRange(i + 1,
+                [
+                    new CodeInstruction(OpCodes.Dup),
+                    new CodeInstruction(OpCodes.Ldc_R4, AnimationTimeScale),
+                    new CodeInstruction(OpCodes.Callvirt, setTimeScaleMethod)
+                ]);
+                timeScaleInjected = true;
+                i += 3;
+            }
+        }
+
+        return codes;
     }
 }
 
